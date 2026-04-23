@@ -34,9 +34,11 @@ dependencies:
   # The following adds the Cupertino Icons font to your application.
   # Use with the CupertinoIcons class for iOS style icons.
   cupertino_icons: ^1.0.8
-  google_maps_flutter: ^2.17.0
   geolocator: ^14.0.2
   permission_handler: ^12.0.1
+  flutter_map: ^7.0.0
+  latlong2: ^0.9.0
+  http: ^1.2.0
 
 dev_dependencies:
   flutter_test:
@@ -61,7 +63,8 @@ flutter:
   uses-material-design: true
 
   # To add assets to your application, add an assets section, like this:
-  # assets:
+  assets:
+    - assets/routes/
   #   - images/a_dot_burr.jpeg
   #   - images/a_dot_ham.jpeg
 
