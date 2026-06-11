@@ -10,9 +10,11 @@
 import 'package:flutter/material.dart';
 import 'package:flutter_map/flutter_map.dart';
 import 'package:latlong2/latlong.dart';
-
+import 'package:thesis_app/models/log_entry.dart';
 import 'package:thesis_app/data/jeepney_routes.dart';
 import 'package:thesis_app/screens/route_finder.dart';
+import 'package:thesis_app/screens/trip_tracker.dart';
+import 'package:thesis_app/services/pdf_exporter.dart';
 
 void main() {
   runApp(const MyApp());
@@ -88,10 +90,12 @@ class _AppShell extends StatefulWidget {
 }
 
 class _AppShellState extends State<_AppShell> {
-  int                _currentIndex = 0;
-  final List<LogEntry> _log        = [];
+  int                  _currentIndex = 0;
+  final List<LogEntry>   _log          = [];
+  final List<TripRecord> _trips        = [];
 
-  void _addLog(LogEntry entry) => setState(() => _log.add(entry));
+  void _addLog(LogEntry entry)       => setState(() => _log.add(entry));
+  void _addTrip(TripRecord trip)     => setState(() => _trips.add(trip));
 
   @override
   Widget build(BuildContext context) {
@@ -101,9 +105,10 @@ class _AppShellState extends State<_AppShell> {
         children: [
           // Page 0 — Route Finder
           RouteFinderPage(
-            allRoutes:   widget.allRoutes,
-            routesReady: widget.routesReady,
-            onLog:       _addLog,
+            allRoutes:      widget.allRoutes,
+            routesReady:    widget.routesReady,
+            onLog:          _addLog,
+            onTripComplete: _addTrip,
           ),
           // Page 1 — Directory
           _DirectoryPage(allRoutes: widget.allRoutes),
@@ -112,6 +117,8 @@ class _AppShellState extends State<_AppShell> {
             entries:  _log,
             onClear:  () => setState(() => _log.clear()),
           ),
+          // Page 3 — Trip Tracker
+          TripTrackerPage(trips: _trips),
         ],
       ),
       bottomNavigationBar: NavigationBar(
@@ -129,6 +136,10 @@ class _AppShellState extends State<_AppShell> {
           NavigationDestination(
             icon:  Icon(Icons.terminal),
             label: 'Log',
+          ),
+          NavigationDestination(
+            icon:  Icon(Icons.route),
+            label: 'Trip Tracker',
           ),
         ],
       ),
@@ -492,7 +503,15 @@ class _LogPage extends StatelessWidget {
                           fontSize:   17,
                           color:      Colors.black87)),
                   const Spacer(),
-                  if (entries.isNotEmpty)
+                  if (entries.isNotEmpty) ...[
+                    TextButton.icon(
+                      onPressed: () => PdfExporter.exportLogs(entries),
+                      icon:  const Icon(Icons.picture_as_pdf, size: 16),
+                      label: const Text('Export',
+                          style: TextStyle(fontSize: 13)),
+                      style: TextButton.styleFrom(
+                          foregroundColor: const Color(0xFF1A73E8)),
+                    ),
                     TextButton.icon(
                       onPressed: onClear,
                       icon:  const Icon(Icons.clear_all, size: 16),
@@ -501,6 +520,7 @@ class _LogPage extends StatelessWidget {
                       style: TextButton.styleFrom(
                           foregroundColor: Colors.redAccent),
                     ),
+                  ],
                 ],
               ),
             ),

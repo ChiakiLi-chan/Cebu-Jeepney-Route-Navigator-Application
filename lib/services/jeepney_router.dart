@@ -12,305 +12,17 @@
 //   6. Reject if ride stop count < 2     → RejectionGate.rideTooShort
 //   7. Score = db + dd + gapPenalty      (lower = better)
 //
-// ── Multi-transfer algorithm (new) ───────────────────────────────────────────
-//   1. Build a graph: every route-path point is a node; consecutive points on
-//      the same route are connected by onRoute edges (cost = haversine distance).
-//   2. Detect transfers: for every pair of routes, scan their points and connect
-//      stops that are within transferRadiusMeters with transfer edges whose cost
-//      is (walk distance + transferPenaltyMeters).
-//   3. Add virtual origin/destination nodes each connected to nearby route stops.
-//   4. Run Dijkstra from the origin node. A per-node transfer counter ensures
-//      paths never exceed maxTransfersAllowed.
-//   5. Backtrack from the destination node to reconstruct RouteSegments.
-//   6. Convert to RouteJourney, score, rank, return top N.
-//
-// findRoutes() tries multi-transfer first; falls back to single-route if no
-// multi-transfer path is found, then returns RoutingFailure with diagnostics.
+// ── Multi-transfer algorithm ──────────────────────────────────────────────────
+//   1. Build graph: every route-path point is a node.
+//   2. Connect stops within transferRadiusMeters with transfer edges.
+//   3. Add virtual origin/destination nodes.
+//   4. Run Dijkstra; backtrack to reconstruct RouteSegments.
+//   5. Convert to RouteJourney, score, rank, return top N.
 
 import 'package:latlong2/latlong.dart';
 import 'package:thesis_app/data/jeepney_routes.dart';
+import 'package:thesis_app/models/routing_models.dart';
 
-// ══════════════════════════════════════════════════════════════════════════════
-// REJECTION DIAGNOSTICS  (unchanged)
-// ══════════════════════════════════════════════════════════════════════════════
-
-/// Which gate eliminated a route.
-enum RejectionGate {
-  originTooFar,    // nearest point to Origin exceeded radiusMeters
-  destTooFar,      // nearest point to Destination exceeded radiusMeters
-  wrongDirection,  // boarding index >= dropoff index (route runs backwards)
-  rideTooShort,    // dropoff - boarding < 2 (trivially short segment)
-}
-
-extension RejectionGateLabel on RejectionGate {
-  String get label {
-    switch (this) {
-      case RejectionGate.originTooFar:   return 'Origin too far from route';
-      case RejectionGate.destTooFar:     return 'Destination too far from route';
-      case RejectionGate.wrongDirection: return 'Route travels in wrong direction';
-      case RejectionGate.rideTooShort:   return 'Ride segment too short';
-    }
-  }
-}
-
-/// Diagnostic record for one rejected route.
-class RouteRejection {
-  final JeepneyRoute  route;
-  final RejectionGate gate;
-  final double?       nearestOriginMeters;
-  final double?       nearestDestMeters;
-
-  const RouteRejection({
-    required this.route,
-    required this.gate,
-    this.nearestOriginMeters,
-    this.nearestDestMeters,
-  });
-
-  String get detail {
-    String fmt(double? m) => m == null
-        ? ''
-        : m < 1000
-            ? ' (nearest: ${m.round()} m)'
-            : ' (nearest: ${(m / 1000).toStringAsFixed(1)} km)';
-    switch (gate) {
-      case RejectionGate.originTooFar:   return gate.label + fmt(nearestOriginMeters);
-      case RejectionGate.destTooFar:     return gate.label + fmt(nearestDestMeters);
-      case RejectionGate.wrongDirection: return gate.label;
-      case RejectionGate.rideTooShort:   return gate.label;
-    }
-  }
-}
-
-// ══════════════════════════════════════════════════════════════════════════════
-// SINGLE-ROUTE RESULT  (kept for backward compat; used internally as fallback)
-// ══════════════════════════════════════════════════════════════════════════════
-
-class RouteRecommendation {
-  final JeepneyRoute route;
-  final int          boardingIndex;
-  final int          dropoffIndex;
-  final double       walkToBoardingMeters;
-  final double       walkFromDropoffMeters;
-  final double       score;
-
-  const RouteRecommendation({
-    required this.route,
-    required this.boardingIndex,
-    required this.dropoffIndex,
-    required this.walkToBoardingMeters,
-    required this.walkFromDropoffMeters,
-    required this.score,
-  });
-
-  LatLng get boardingPoint      => route.path[boardingIndex];
-  LatLng get dropoffPoint       => route.path[dropoffIndex];
-  double get totalWalkingMeters => walkToBoardingMeters + walkFromDropoffMeters;
-  int    get rideSegmentCount   => dropoffIndex - boardingIndex;
-
-  List<LatLng> get ridePolyline =>
-      route.path.sublist(boardingIndex, dropoffIndex + 1);
-}
-
-// ══════════════════════════════════════════════════════════════════════════════
-// MULTI-TRANSFER RESULT TYPES
-// ══════════════════════════════════════════════════════════════════════════════
-
-/// One leg of a multi-route journey: board one jeepney, ride it, alight.
-class RouteSegment {
-  final JeepneyRoute route;
-
-  /// Index into route.path where the passenger boards.
-  final int boardingIndex;
-
-  /// Index into route.path where the passenger alights.
-  final int dropoffIndex;
-
-  /// Walk distance from the previous alight point (or origin) to boardingPoint.
-  final double walkToBoardingMeters;
-
-  /// Walk distance from dropoffPoint to the next board point (or destination).
-  final double walkFromDropoffMeters;
-
-  /// True when this segment wraps around the end of a circular route.
-  /// boarding index > dropoff index in this case; the ride goes
-  /// path[boardingIndex..last] + path[0..dropoffIndex].
-  final bool isWrapAround;
-
-  const RouteSegment({
-    required this.route,
-    required this.boardingIndex,
-    required this.dropoffIndex,
-    required this.walkToBoardingMeters,
-    required this.walkFromDropoffMeters,
-    this.isWrapAround = false,
-  });
-
-  LatLng get boardingPoint => route.path[boardingIndex];
-  LatLng get dropoffPoint  => route.path[dropoffIndex];
-
-  /// Number of stops in this ride leg (always positive).
-  int get stopCount => isWrapAround
-      ? (route.path.length - 1 - boardingIndex) + dropoffIndex
-      : dropoffIndex - boardingIndex;
-
-  /// Cumulative haversine distance of all on-route segments.
-  double get rideDistanceMeters {
-    double total = 0;
-    final path   = route.path;
-    if (isWrapAround) {
-      // boarding → end of path
-      for (int i = boardingIndex; i < path.length - 1; i++) {
-        total += const Distance().as(LengthUnit.Meter, path[i], path[i + 1]);
-      }
-      // start of path → dropoff
-      for (int i = 0; i < dropoffIndex; i++) {
-        total += const Distance().as(LengthUnit.Meter, path[i], path[i + 1]);
-      }
-    } else {
-      for (int i = boardingIndex; i < dropoffIndex; i++) {
-        total += const Distance().as(LengthUnit.Meter, path[i], path[i + 1]);
-      }
-    }
-    return total;
-  }
-
-  /// Ordered path points for the active ride (boarding → dropoff inclusive).
-  List<LatLng> get ridePolyline {
-    if (isWrapAround) {
-      return [
-        ...route.path.sublist(boardingIndex),
-        ...route.path.sublist(0, dropoffIndex + 1),
-      ];
-    }
-    return route.path.sublist(boardingIndex, dropoffIndex + 1);
-  }
-}
-
-/// A complete journey from origin to destination, possibly spanning multiple
-/// jeepney routes connected by walking transfer legs.
-class RouteJourney {
-  /// Ordered list of ride segments. Length 1 = direct (no transfer).
-  final List<RouteSegment> segments;
-
-  /// Walking waypoints between consecutive segments (length = segments.length - 1).
-  /// Each element is the geographic midpoint of the transfer walk; useful for
-  /// drawing the walk polyline on the map.
-  final List<LatLng> transferPoints;
-
-  final double totalWalkingMeters;
-  final int    transferCount;
-
-  /// Rough estimate: walking at 5 km/h + riding at 20 km/h +
-  /// 5 min penalty per transfer.
-  final double estimatedJourneyMinutes;
-
-  /// Lower score = better. Combines walking, transfers, and ride efficiency.
-  final double score;
-
-  const RouteJourney({
-    required this.segments,
-    required this.transferPoints,
-    required this.totalWalkingMeters,
-    required this.transferCount,
-    required this.estimatedJourneyMinutes,
-    required this.score,
-  });
-
-  bool get isDirect => transferCount == 0;
-
-  double get totalRideDistanceMeters =>
-      segments.fold(0.0, (sum, s) => sum + s.rideDistanceMeters);
-
-  /// Concatenated polyline: walk-to-first-board, ride, walk-to-transfer,
-  /// ride, …, walk-to-destination.  Suitable for drawing the full path.
-  List<LatLng> get fullPolyline {
-    final points = <LatLng>[];
-    for (int i = 0; i < segments.length; i++) {
-      points.addAll(segments[i].ridePolyline);
-      if (i < transferPoints.length) points.add(transferPoints[i]);
-    }
-    return points;
-  }
-
-  /// Convenience constructor: wrap a legacy RouteRecommendation as a
-  /// single-segment RouteJourney so both code paths share one result type.
-  factory RouteJourney.fromSingleRoute(RouteRecommendation rec) {
-    final isWrap  = rec.boardingIndex > rec.dropoffIndex;
-    final segment = RouteSegment(
-      route:                 rec.route,
-      boardingIndex:         rec.boardingIndex,
-      dropoffIndex:          rec.dropoffIndex,
-      walkToBoardingMeters:  rec.walkToBoardingMeters,
-      walkFromDropoffMeters: rec.walkFromDropoffMeters,
-      isWrapAround:          isWrap,
-    );
-    final walking = rec.totalWalkingMeters;
-    final rideKm  = segment.ridePolyline.length > 1
-        ? _polylineDistance(segment.ridePolyline) / 1000.0
-        : 0.0;
-    final minutes = (walking / 1000.0 / 5.0 * 60.0) + (rideKm / 20.0 * 60.0);
-
-    return RouteJourney(
-      segments:                [segment],
-      transferPoints:          const [],
-      totalWalkingMeters:      walking,
-      transferCount:           0,
-      estimatedJourneyMinutes: minutes,
-      score:                   rec.score,
-    );
-  }
-}
-
-// ══════════════════════════════════════════════════════════════════════════════
-// TOP-LEVEL RESULT TYPES
-// ══════════════════════════════════════════════════════════════════════════════
-
-sealed class RoutingResult {}
-
-/// At least one viable journey was found.
-/// [recommendations] is sorted ascending by score (best first).
-/// Single-route journeys are returned here too (transferCount == 0).
-class RoutingSuccess extends RoutingResult {
-  final List<RouteJourney> recommendations;
-
-  /// True when at least one result required a transfer.
-  final bool hasTransfers;
-
-  RoutingSuccess(this.recommendations, {this.hasTransfers = false});
-}
-
-class RoutingFailure extends RoutingResult {
-  final String            reason;
-  final List<RouteRejection> rejections;
-
-  RoutingFailure(this.reason, {this.rejections = const []});
-
-  int get countOriginTooFar =>
-      rejections.where((r) => r.gate == RejectionGate.originTooFar).length;
-  int get countDestTooFar =>
-      rejections.where((r) => r.gate == RejectionGate.destTooFar).length;
-  int get countWrongDirection =>
-      rejections.where((r) => r.gate == RejectionGate.wrongDirection).length;
-  int get countRideTooShort =>
-      rejections.where((r) => r.gate == RejectionGate.rideTooShort).length;
-
-  RouteRejection? get closestOriginMiss {
-    final c = rejections
-        .where((r) => r.gate == RejectionGate.originTooFar && r.nearestOriginMeters != null)
-        .toList()
-      ..sort((a, b) => a.nearestOriginMeters!.compareTo(b.nearestOriginMeters!));
-    return c.isEmpty ? null : c.first;
-  }
-
-  RouteRejection? get closestDestMiss {
-    final c = rejections
-        .where((r) => r.gate == RejectionGate.destTooFar && r.nearestDestMeters != null)
-        .toList()
-      ..sort((a, b) => a.nearestDestMeters!.compareTo(b.nearestDestMeters!));
-    return c.isEmpty ? null : c.first;
-  }
-}
 
 // ══════════════════════════════════════════════════════════════════════════════
 // GRAPH INTERNALS  (file-private)
@@ -416,6 +128,83 @@ class _DResult {
 }
 
 // ══════════════════════════════════════════════════════════════════════════════
+// PRECOMPUTED STATIC GRAPH
+// ══════════════════════════════════════════════════════════════════════════════
+
+/// The static (query-independent) parts of the routing graph, serialisable
+/// for passing across isolate boundaries via compute().
+///
+/// Built once when routes load via [runStaticGraphIsolate].
+/// Passed into every [RoutingMessage] so [_buildGraph] can skip the expensive
+/// O(R² × n²) transfer-edge scan on each routing query.
+class PrecomputedRouteGraph {
+  /// Parallel arrays — one entry per static node (route path points only;
+  /// virtual origin/dest nodes are added per-query and are NOT stored here).
+  final List<double>  nodeLats;
+  final List<double>  nodeLngs;
+  final List<String?> nodeRouteIds;   // null for virtual nodes (unused here)
+  final List<int?>    nodePathIndices;
+
+  /// Adjacency list containing only onRoute and transfer edges.
+  /// walkToRoute edges are omitted — they depend on origin/destination.
+  /// adjTo[i], adjCost[i], adjKind[i] are parallel lists for node i.
+  final List<List<int>>    adjTo;
+  final List<List<double>> adjCost;
+  final List<List<int>>    adjKind;   // _EdgeKind.index values
+
+  /// routeId → ordered list of node ids (same semantics as _Graph.routeNodeIds).
+  final Map<String, List<int>> routeNodeIds;
+
+  /// routeId → integer bitmask index (same semantics as _Graph.routeIndex).
+  final Map<String, int> routeIndex;
+
+  /// Total number of static nodes (= nodeLats.length).
+  final int nodeCount;
+
+  const PrecomputedRouteGraph({
+    required this.nodeLats,
+    required this.nodeLngs,
+    required this.nodeRouteIds,
+    required this.nodePathIndices,
+    required this.adjTo,
+    required this.adjCost,
+    required this.adjKind,
+    required this.routeNodeIds,
+    required this.routeIndex,
+    required this.nodeCount,
+  });
+}
+
+/// User-selectable routing priority that adjusts scoring weights.
+enum RoutePriority {
+  balanced,  // default: walk×1.0 + ride×0.25
+  time,      // shorter total trip: walk×1.0 + ride×0.5
+  lessWalk,  // minimise walking: walk×2.0 + ride×0.1
+}
+
+/// Message sent to the static-graph precomputation isolate.
+class StaticGraphMessage {
+  final List<JeepneyRoute> allRoutes;
+  final double             transferRadiusMeters;
+  final double             transferPenaltyMeters;
+
+  const StaticGraphMessage({
+    required this.allRoutes,
+    required this.transferRadiusMeters,
+    required this.transferPenaltyMeters,
+  });
+}
+
+/// Top-level entry point for the static graph precomputation isolate.
+PrecomputedRouteGraph runStaticGraphIsolate(StaticGraphMessage msg) {
+  final router = JeepneyRouter(
+    transferRadiusMeters:  msg.transferRadiusMeters,
+    transferPenaltyMeters: msg.transferPenaltyMeters,
+  );
+  return router.buildStaticGraph(msg.allRoutes);
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
 // ROUTER
 // ══════════════════════════════════════════════════════════════════════════════
 
@@ -457,7 +246,20 @@ class JeepneyRouter {
     required LatLng             destination,
     required List<JeepneyRoute> allRoutes,
     bool                        allowTransfers = true,
+    PrecomputedRouteGraph?      precomputed,
+    RoutePriority               priority       = RoutePriority.balanced,
   }) {
+    // ── Scoring weights derived from priority ────────────────────────────────
+    double walkWeight, rideWeight;
+    switch (priority) {
+      case RoutePriority.time:
+        walkWeight = 1.0; rideWeight = 0.5;  break;
+      case RoutePriority.lessWalk:
+        walkWeight = 2.0; rideWeight = 0.1;  break;
+      case RoutePriority.balanced:
+      default:
+        walkWeight = 1.0; rideWeight = 0.25; break;
+    }
     // ── Pre-scan guards ─────────────────────────────────────────────────────
     // Only reject "same location" when the two points are truly identical
     // (< 5 m apart).  A slightly larger gap (5–150 m) could legitimately
@@ -470,7 +272,8 @@ class JeepneyRouter {
     }
 
     // ── Step 1: try single-route (fast, no graph needed) ────────────────────
-    final singleResult = _trySingleRoute(origin, destination, allRoutes);
+    final singleResult = _trySingleRoute(origin, destination, allRoutes,
+        walkWeight: walkWeight, rideWeight: rideWeight, priority: priority);
 
     // If we have direct routes and transfers are disabled, return immediately.
     if (!allowTransfers) {
@@ -488,7 +291,9 @@ class JeepneyRouter {
     }
 
     // ── Step 2: try multi-transfer via graph search ──────────────────────────
-    final multiJourneys = _tryMultiRoute(origin, destination, allRoutes);
+    final multiJourneys = _tryMultiRoute(origin, destination, allRoutes,
+        precomputed: precomputed, walkWeight: walkWeight, rideWeight: rideWeight,
+        priority: priority);
 
     // ── Step 3: merge and rank ───────────────────────────────────────────────
     final allJourneys = <RouteJourney>[
@@ -566,30 +371,21 @@ class JeepneyRouter {
     final seen    = <String>{};
     final ranked  = <RouteJourney>[];
     for (final j in allJourneys) {
-      // Independent hard cap — fires before any comparison so that a journey
-      // with an unreasonable walk is never shown even when it is the only
-      // candidate. Covers both single-route and multi-route journeys.
+        // Suppression 1: Unconditional walk cap
       if (j.segments.first.walkToBoardingMeters > walkIndependentCap) continue;
       if (j.segments.last.walkFromDropoffMeters  > walkIndependentCap) continue;
-
-      // Relative quality gate: discard if either the walk-to-board or the
-      // walk-to-destination is disproportionately longer than the best
-      // suggestion's equivalent walk.
+        // Suppression 2: Relative walk quality
       if (j.segments.first.walkToBoardingMeters > boardCeiling) continue;
       if (j.segments.last.walkFromDropoffMeters  > destCeiling)  continue;
-
+        // Suppression 3: Transfer redundancy
       if (j.transferCount > 0 && directRouteIds.isNotEmpty) {
         final firstRouteId = j.segments.first.route.routeId;
         final lastRouteId  = j.segments.last.route.routeId;
 
-        // First route: transfer is always redundant — user could ride it
-        // straight to destination with no transfer at all.
+        // First leg: user could ride it straight to destination
         if (directRouteIds.contains(firstRouteId)) continue;
 
-        // Last route: only suppress if the direct version's boarding walk is
-        // actually reachable (≤ boardCeiling). If the direct route was already
-        // disqualified by the walk filter, keeping the transfer route is correct
-        // — it provides the same last-route ride but avoids the long first walk.
+        // Last leg: suppress only if direct boarding walk is reachable
         if (directRouteIds.contains(lastRouteId)) {
           final directWalk = directCandidates[lastRouteId]!.walkToBoardingMeters;
           if (directWalk <= boardCeiling) continue;
@@ -601,11 +397,7 @@ class JeepneyRouter {
       if (ranked.length >= maxResults) break;
     }
 
-    // ── Suppression fallback ─────────────────────────────────────────────────
-    // If every candidate was suppressed (ranked is empty) but valid journeys
-    // exist, show the best 1-2 options without filters rather than returning
-    // zero results. This prevents the walk-quality and directRouteIds checks
-    // from producing a blank screen when they are collectively too aggressive.
+    // ── Suppression fallback show best 1-2 unfiltered if all suppressed ─────────────────────────────────────────────────
     if (ranked.isEmpty && allJourneys.isNotEmpty) {
       final fallbackSeen = <String>{};
       for (final j in allJourneys) {
@@ -613,6 +405,8 @@ class JeepneyRouter {
         if (fallbackSeen.add(key)) ranked.add(j);
         if (ranked.length >= 2) break;
       }
+      final hasTransfers = ranked.any((j) => j.transferCount > 0);
+      return RoutingSuccess(ranked, hasTransfers: hasTransfers, isFallback: true);
     }
 
     final hasTransfers = ranked.any((j) => j.transferCount > 0);
@@ -626,13 +420,17 @@ class JeepneyRouter {
   _SingleResult _trySingleRoute(
     LatLng origin,
     LatLng destination,
-    List<JeepneyRoute> allRoutes,
-  ) {
+    List<JeepneyRoute> allRoutes, {
+    double        walkWeight = 1.0,
+    double        rideWeight = 0.25,
+    RoutePriority priority   = RoutePriority.balanced,
+  }) {
     final candidates = <RouteRecommendation>[];
     final rejections = <RouteRejection>[];
 
     for (final route in allRoutes) {
-      final r = _evaluate(route, origin, destination);
+      final r = _evaluate(route, origin, destination,
+          walkWeight: walkWeight, rideWeight: rideWeight, priority: priority);
       if (r is _Pass) candidates.add(r.recommendation);
       else if (r is _Fail) rejections.add(r.rejection);
     }
@@ -641,7 +439,11 @@ class JeepneyRouter {
     return _SingleResult(candidates: candidates, rejections: rejections);
   }
 
-  _EvalResult _evaluate(JeepneyRoute route, LatLng origin, LatLng dest) {
+  _EvalResult _evaluate(JeepneyRoute route, LatLng origin, LatLng dest, {
+    double        walkWeight = 1.0,
+    double        rideWeight = 0.25,
+    RoutePriority priority   = RoutePriority.balanced,
+  }) {
     final path       = route.path;
     final n          = path.length;
     if (n < 2) return _Skip();
@@ -751,6 +553,10 @@ class JeepneyRouter {
           walkToBoarding:  walkBoard,
           walkFromDropoff: walkDrop,
           rideMeters:      rideM,
+          walkWeight:      walkWeight,
+          rideWeight:      rideWeight,
+          priority:        priority,
+          isModern:        route.isModern,
         );
 
         if (score < bestScore) {
@@ -788,6 +594,123 @@ class JeepneyRouter {
   }
 
   // ════════════════════════════════════════════════════════════════════════════
+  // PUBLIC: STATIC GRAPH PRECOMPUTATION
+  // ════════════════════════════════════════════════════════════════════════════
+
+  /// Build the query-independent parts of the routing graph (route nodes,
+  /// onRoute edges, transfer edges) and return them in a serialisable form.
+  ///
+  /// Call this once after routes load (via [runStaticGraphIsolate]) and cache
+  /// the result.  Pass it to [RoutingMessage.precomputedGraph] so each routing
+  /// query skips the expensive O(R² × n²) transfer-edge scan.
+  PrecomputedRouteGraph buildStaticGraph(List<JeepneyRoute> allRoutes) {
+    final nodes        = <_Node>[];
+    final routeNodeIds = <String, List<int>>{};
+    final routeIndex   = <String, int>{};
+    int   nextId       = 0;
+
+    // ── 1. One node per route-path point ────────────────────────────────────
+    for (int ri = 0; ri < allRoutes.length; ri++) {
+      final route = allRoutes[ri];
+      routeIndex[route.routeId] = ri;
+      final ids = <int>[];
+      for (int i = 0; i < route.path.length; i++) {
+        final id = nextId++;
+        nodes.add(_Node(id: id, point: route.path[i], route: route, pathIndex: i));
+        ids.add(id);
+      }
+      routeNodeIds[route.routeId] = ids;
+    }
+
+    final nodeCount = nextId;
+    final adj = List<List<_Edge>>.generate(nodeCount, (_) => []);
+
+    // ── 2. onRoute edges (consecutive stops, directed forward) ───────────────
+    for (final route in allRoutes) {
+      final ids = routeNodeIds[route.routeId]!;
+      for (int i = 0; i + 1 < ids.length; i++) {
+        final cost = _haversine(nodes[ids[i]].point, nodes[ids[i + 1]].point);
+        adj[ids[i]].add(_Edge(to: ids[i + 1], cost: cost, kind: _EdgeKind.onRoute));
+      }
+      // Closure edge for circular routes
+      if (_isCircular(route) && ids.length >= 3) {
+        final cost = _haversine(nodes[ids.last].point, nodes[ids.first].point);
+        adj[ids.last].add(_Edge(to: ids.first, cost: cost, kind: _EdgeKind.onRoute));
+      }
+    }
+
+    // ── 3. Transfer edges (cross-route stops within transferRadiusMeters) ────
+    const transferWalkMultiplier = 3.0;
+
+    final bbox = <String, _BBox>{};
+    for (final route in allRoutes) {
+      double minLat = double.infinity,  maxLat = -double.infinity;
+      double minLng = double.infinity,  maxLng = -double.infinity;
+      for (final p in route.path) {
+        if (p.latitude  < minLat) minLat = p.latitude;
+        if (p.latitude  > maxLat) maxLat = p.latitude;
+        if (p.longitude < minLng) minLng = p.longitude;
+        if (p.longitude > maxLng) maxLng = p.longitude;
+      }
+      bbox[route.routeId] = _BBox(minLat, maxLat, minLng, maxLng);
+    }
+
+    final marginDeg = transferRadiusMeters / 111000.0;
+    final routeList = routeNodeIds.entries.toList();
+    for (int ri = 0; ri < routeList.length; ri++) {
+      for (int rj = ri + 1; rj < routeList.length; rj++) {
+        final routeIdA = routeList[ri].key;
+        final routeIdB = routeList[rj].key;
+        final bboxA    = bbox[routeIdA]!;
+        final bboxB    = bbox[routeIdB]!;
+
+        if (bboxA.minLat - marginDeg > bboxB.maxLat ||
+            bboxB.minLat - marginDeg > bboxA.maxLat ||
+            bboxA.minLng - marginDeg > bboxB.maxLng ||
+            bboxB.minLng - marginDeg > bboxA.maxLng) continue;
+
+        final idsA = routeList[ri].value;
+        final idsB = routeList[rj].value;
+        for (final idA in idsA) {
+          for (final idB in idsB) {
+            final d = _haversine(nodes[idA].point, nodes[idB].point);
+            if (d <= transferRadiusMeters) {
+              final cost = d * transferWalkMultiplier + transferPenaltyMeters;
+              adj[idA].add(_Edge(to: idB, cost: cost, kind: _EdgeKind.transfer));
+              adj[idB].add(_Edge(to: idA, cost: cost, kind: _EdgeKind.transfer));
+            }
+          }
+        }
+      }
+    }
+
+    // ── 4. Serialise to flat arrays ──────────────────────────────────────────
+    final lats          = List<double>.filled(nodeCount, 0);
+    final lngs          = List<double>.filled(nodeCount, 0);
+    final nodeRouteIds  = List<String?>.filled(nodeCount, null);
+    final nodePathIdx   = List<int?>.filled(nodeCount, null);
+    for (int i = 0; i < nodeCount; i++) {
+      lats[i]         = nodes[i].point.latitude;
+      lngs[i]         = nodes[i].point.longitude;
+      nodeRouteIds[i] = nodes[i].route?.routeId;
+      nodePathIdx[i]  = nodes[i].pathIndex;
+    }
+
+    return PrecomputedRouteGraph(
+      nodeLats:        lats,
+      nodeLngs:        lngs,
+      nodeRouteIds:    nodeRouteIds,
+      nodePathIndices: nodePathIdx,
+      adjTo:    List.generate(nodeCount, (i) => adj[i].map((e) => e.to).toList()),
+      adjCost:  List.generate(nodeCount, (i) => adj[i].map((e) => e.cost).toList()),
+      adjKind:  List.generate(nodeCount, (i) => adj[i].map((e) => e.kind.index).toList()),
+      routeNodeIds: routeNodeIds,
+      routeIndex:   routeIndex,
+      nodeCount:    nodeCount,
+    );
+  }
+
+  // ════════════════════════════════════════════════════════════════════════════
   // MULTI-ROUTE: GRAPH BUILD
   // ════════════════════════════════════════════════════════════════════════════
 
@@ -796,23 +719,35 @@ class JeepneyRouter {
   List<RouteJourney> _tryMultiRoute(
     LatLng             origin,
     LatLng             destination,
-    List<JeepneyRoute> allRoutes,
-  ) {
+    List<JeepneyRoute> allRoutes, {
+    PrecomputedRouteGraph? precomputed,
+    double        walkWeight = 1.0,
+    double        rideWeight = 0.25,
+    RoutePriority priority   = RoutePriority.balanced,
+  }) {
     // Build graph
-    final graph = _buildGraph(origin, destination, allRoutes);
+    final graph = _buildGraph(origin, destination, allRoutes,
+        precomputed: precomputed);
 
     // Dijkstra
     final result = _dijkstra(graph);
 
     // Extract journeys
-    return _extractJourneys(graph, result, origin, destination);
+    return _extractJourneys(graph, result, origin, destination,
+        walkWeight: walkWeight, rideWeight: rideWeight, priority: priority);
   }
 
   _Graph _buildGraph(
     LatLng             origin,
     LatLng             destination,
-    List<JeepneyRoute> allRoutes,
-  ) {
+    List<JeepneyRoute> allRoutes, {
+    PrecomputedRouteGraph? precomputed,
+  }) {
+    // Fast path: static nodes + edges already built; only inject virtual
+    // origin/destination nodes and their per-query walkToRoute edges.
+    if (precomputed != null) {
+      return _buildGraphFromPrecomputed(origin, destination, allRoutes, precomputed);
+    }
     final nodes         = <_Node>[];
     final routeNodeIds  = <String, List<int>>{};
     final routeIndex    = <String, int>{};
@@ -959,8 +894,79 @@ class JeepneyRouter {
     );
   }
 
-  // ════════════════════════════════════════════════════════════════════════════
-  // DIJKSTRA  (transfer-aware, integer bitmask state)
+  // ── Fast-path graph build using precomputed static data ───────────────────
+  //
+  // Skips node creation, onRoute edges, and the expensive transfer-edge scan.
+  // Only adds the two virtual nodes (origin/dest) and their walkToRoute edges.
+  _Graph _buildGraphFromPrecomputed(
+    LatLng                origin,
+    LatLng                destination,
+    List<JeepneyRoute>    allRoutes,
+    PrecomputedRouteGraph precomputed,
+  ) {
+    final routeById = { for (final r in allRoutes) r.routeId: r };
+    final n = precomputed.nodeCount;
+
+    // Reconstruct _Node objects from flat arrays + live route references.
+    final nodes = List<_Node>.generate(n, (i) {
+      final rid = precomputed.nodeRouteIds[i];
+      return _Node(
+        id:        i,
+        point:     LatLng(precomputed.nodeLats[i], precomputed.nodeLngs[i]),
+        route:     rid != null ? routeById[rid] : null,
+        pathIndex: precomputed.nodePathIndices[i],
+      );
+    });
+
+    // Virtual origin and destination nodes.
+    final originId = n;
+    final destId   = n + 1;
+    nodes.add(_Node(id: originId, point: origin));
+    nodes.add(_Node(id: destId,   point: destination));
+
+    // Reconstruct adjacency list from flat arrays (mutable copies so we can
+    // append walkToRoute edges without touching the precomputed data).
+    final adj = List<List<_Edge>>.generate(n + 2, (i) {
+      if (i >= n) return <_Edge>[];
+      final tos   = precomputed.adjTo[i];
+      final costs = precomputed.adjCost[i];
+      final kinds = precomputed.adjKind[i];
+      return List<_Edge>.generate(
+        tos.length,
+        (j) => _Edge(to: tos[j], cost: costs[j], kind: _EdgeKind.values[kinds[j]]),
+      );
+    });
+
+    // walkToRoute edges: origin → nearby stops.
+    const walkCostMultiplier = 3.0;
+    for (int id = 0; id < n; id++) {
+      final walkDist = _haversine(origin, nodes[id].point);
+      if (walkDist <= radiusMeters) {
+        adj[originId].add(_Edge(
+          to:   id,
+          cost: walkDist * walkCostMultiplier,
+          kind: _EdgeKind.walkToRoute,
+        ));
+      }
+    }
+
+    // walkToRoute edges: nearby stops → destination.
+    for (int id = 0; id < n; id++) {
+      final d = _haversine(nodes[id].point, destination);
+      if (d <= radiusMeters) {
+        adj[id].add(_Edge(to: destId, cost: d, kind: _EdgeKind.walkToRoute));
+      }
+    }
+
+    return _Graph(
+      nodes:        nodes,
+      adj:          adj,
+      originId:     originId,
+      destId:       destId,
+      routeNodeIds: precomputed.routeNodeIds,
+      routeIndex:   precomputed.routeIndex,
+    );
+  }
   // ════════════════════════════════════════════════════════════════════════════
 
   _DResult _dijkstra(_Graph graph) {
@@ -1046,13 +1052,13 @@ class JeepneyRouter {
     _Graph   graph,
     _DResult result,
     LatLng   origin,
-    LatLng   destination,
-  ) {
+    LatLng   destination, {
+    double        walkWeight = 1.0,
+    double        rideWeight = 0.25,
+    RoutePriority priority   = RoutePriority.balanced,
+  }) {
     final journeys = <RouteJourney>[];
 
-    // For each transfer count, scan all routeMask values at destId to find
-    // the best-cost settled state. With maskRange = 2^numRoutes this is at
-    // most 64 iterations per transfer depth — O(1) in practice.
     for (int t = 1; t <= maxTransfersAllowed; t++) {
       int    bestKey  = -1;
       double bestCost = double.infinity;
@@ -1066,7 +1072,8 @@ class JeepneyRouter {
       if (bestKey == -1 || bestCost.isInfinite) continue;
 
       final journey = _backtrack(
-          graph, result, graph.destId, t, bestKey, origin, destination);
+          graph, result, graph.destId, t, bestKey, origin, destination,
+          rideWeight: rideWeight, walkWeight: walkWeight, priority: priority);
       if (journey != null) journeys.add(journey);
     }
 
@@ -1081,8 +1088,11 @@ class JeepneyRouter {
     int      transfers,
     int      destKey,
     LatLng   origin,
-    LatLng   destination,
-  ) {
+    LatLng   destination, {
+    double        rideWeight = 0.25,
+    double        walkWeight = 1.0,
+    RoutePriority priority   = RoutePriority.balanced,
+  }) {
     // Walk back through integer parent pointers.
     final rawKeys = <int>[];
     int cur = destKey;
@@ -1165,13 +1175,12 @@ class JeepneyRouter {
         // Purely minimising walkFromAlight (the old logic) ignores ride
         // distance and causes the route to go the long way around a circular
         // loop just to save a few metres of walking at the end.
-        const rideWeight = 0.25;
         double bestScore = double.infinity;
 
         // Forward pass: boardingIdx+1 → end of path
         for (int i = boardingIdx + 1; i < pathLen; i++) {
           final walkDist = _haversine(segRoute.path[i], destination);
-          if (walkDist > radiusMeters) continue; // only consider stops within reach
+          if (walkDist > radiusMeters) continue;
           final rideDist = prefix[i] - prefix[boardingIdx];
           final score    = walkDist + rideDist * rideWeight;
           if (score < bestScore) { bestScore = score; dropoffIdx = i; }
@@ -1271,9 +1280,9 @@ class JeepneyRouter {
     final estimatedMinutes =
         (walkKm / 5.0 * 60.0) + (rideKm / 20.0 * 60.0) + (transfers * 5.0);
 
-    // Score: total walk + transfer penalty already baked into Dijkstra cost,
-    // so we re-derive a clean comparable score here.
-    final score = totalWalk + (transfers * transferPenaltyMeters);
+    // Score: re-derive a clean comparable score that respects priority.
+    final score = totalWalk * walkWeight + (rideKm * 1000.0 * rideWeight) +
+                  (transfers * transferPenaltyMeters);
 
     return RouteJourney(
       segments:                segments,
@@ -1300,17 +1309,15 @@ class JeepneyRouter {
   }
 
   double _singleScore({
-    required double walkToBoarding,
-    required double walkFromDropoff,
-    required double rideMeters,
+    required double        walkToBoarding,
+    required double        walkFromDropoff,
+    required double        rideMeters,
+    double                 walkWeight = 1.0,
+    double                 rideWeight = 0.25,
+    RoutePriority          priority   = RoutePriority.balanced,
+    bool                   isModern   = false,
   }) {
-    // Score in "walk-equivalent metres" using realistic speed ratio:
-    //   walking ≈ 5 km/h, riding ≈ 20 km/h → riding costs 1/4 per metre.
-    // This lets the bi×di scan correctly prefer crossing the street (extra
-    // walk) to board the correct-direction pass when it results in a
-    // meaningfully shorter ride.
-    const rideWeight = 0.25;
-    return walkToBoarding + walkFromDropoff + (rideMeters * rideWeight);
+    return (walkToBoarding + walkFromDropoff) * walkWeight + (rideMeters * rideWeight);
   }
 
   double _haversine(LatLng a, LatLng b) => _dist.as(LengthUnit.Meter, a, b);
@@ -1423,6 +1430,11 @@ class RoutingMessage {
   final double             transferPenaltyMeters;
   final int                maxTransfersAllowed;
   final int                maxResults;
+  final RoutePriority      priority;
+
+  /// Optional precomputed static graph. When provided, _buildGraph skips the
+  /// expensive node-creation and transfer-edge scan on every query.
+  final PrecomputedRouteGraph? precomputedGraph;
 
   const RoutingMessage({
     required this.origin,
@@ -1433,6 +1445,8 @@ class RoutingMessage {
     required this.transferPenaltyMeters,
     required this.maxTransfersAllowed,
     required this.maxResults,
+    this.priority = RoutePriority.balanced,
+    this.precomputedGraph,
   });
 }
 
@@ -1446,8 +1460,10 @@ RoutingResult runRoutingIsolate(RoutingMessage msg) {
     maxResults:            msg.maxResults,
   );
   return router.findRoutes(
-    origin:      msg.origin,
-    destination: msg.destination,
-    allRoutes:   msg.allRoutes,
+    origin:          msg.origin,
+    destination:     msg.destination,
+    allRoutes:       msg.allRoutes,
+    precomputed:     msg.precomputedGraph,
+    priority:        msg.priority,
   );
 }

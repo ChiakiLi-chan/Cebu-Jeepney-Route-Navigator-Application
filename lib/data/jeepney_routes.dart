@@ -48,14 +48,9 @@ class RouteEntry {
 
 const List<RouteEntry> routeRegistry = [
   // ── Add / remove / reorder entries here freely ───────────────────────────
+  
   RouteEntry(
-    assetPath: 'assets/routes/13B.geojson',
-    routeId:   '13-B',
-    routeName: 'Talamban – Carbon',
-    color:     Color(0xFFE53935), // red
-  ),
-  RouteEntry(
-    assetPath: 'assets/routes/route_01k_A.geojson',
+    assetPath: 'assets/routes/test.geojson',
     routeId:   '01-K',
     routeName: 'Urgello – Colon - SM - North Terminal',
     color:     Color.fromARGB(255, 118, 6, 4), // red
@@ -64,7 +59,7 @@ const List<RouteEntry> routeRegistry = [
     assetPath: 'assets/routes/route_03A_Complete.geojson',
     routeId:   '03-A',
     routeName: 'Mabolo - Carbon via Panagda-it Manalili',
-    color:     Color.fromARGB(255, 255, 56, 52) // red
+    color:     Color.fromARGB(255, 74, 58, 0) // red
   ),RouteEntry(
     assetPath: 'assets/routes/route_04L_Complete.geojson',
     routeId:   '04-L',
@@ -72,8 +67,20 @@ const List<RouteEntry> routeRegistry = [
     color:     Color.fromARGB(255, 255, 149, 0), // red
   ),
   RouteEntry(
+    assetPath: 'assets/routes/route_13B_Complete.geojson',
+    routeId:   '13-B',
+    routeName: 'Talamban – Carbon',
+    color:     Color(0xFFE53935), // red
+  ),
+  RouteEntry(
+    assetPath: 'assets/routes/route_13C_Complete.geojson',
+    routeId:   '13-C',
+    routeName: 'Talamban - Colon - Echavez',
+    color:     Color.fromARGB(255, 5, 255, 222), // red
+  ),
+  RouteEntry(
     assetPath: 'assets/routes/route_17B_Complete.geojson',
-    routeId:   '17-B',
+    routeId:   '17-B/D',
     routeName: 'Apas - Lahug - Jones - Carbon',
     color:     Color.fromARGB(255, 255, 176, 80), // red
   ),
@@ -82,6 +89,30 @@ const List<RouteEntry> routeRegistry = [
     routeId:   '17-C',
     routeName: 'Apas - Lahug - Ramos - Carbon',
     color:     Color.fromARGB(255, 255, 115, 0), // red
+  ),
+  RouteEntry(
+    assetPath: 'assets/routes/route_20A_Complete.geojson',
+    routeId:   '20-A/B',
+    routeName: 'Ibabao-Mandaue - Ayala',
+    color:     Color.fromARGB(255, 184, 255, 18), // red
+  ),
+  RouteEntry(
+    assetPath: 'assets/routes/route_22I_Complete.geojson',
+    routeId:   '22-I',
+    routeName: 'Country Mall - Mandaue',
+    color:     Color.fromARGB(255, 112, 191, 255), // red
+  ),
+  RouteEntry(
+    assetPath: 'assets/routes/route_62B_Complete.geojson',
+    routeId:   '62-B',
+    routeName: 'Pit-os - Talamban - Carbon',
+    color:     Color.fromARGB(255, 0, 46, 252), // red
+  ),
+  RouteEntry(
+    assetPath: 'assets/routes/route_62C_Complete.geojson',
+    routeId:   '62-C',
+    routeName: 'Pit-os - Talamban - Carbon',
+    color:     Color.fromARGB(255, 255, 7, 251), // red
   ),
   // ↑ paste more RouteEntry(...) blocks here for routes 6–25
 ];
