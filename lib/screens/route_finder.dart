@@ -15,6 +15,8 @@ import 'package:thesis_app/data/jeepney_routes.dart';
 import 'package:thesis_app/services/jeepney_router.dart';
 import 'package:thesis_app/models/routing_models.dart';
 import 'package:thesis_app/services/location_search_service.dart';
+import 'package:thesis_app/services/walk_graph.dart';
+import 'package:thesis_app/services/walk_router.dart';
 import 'package:thesis_app/screens/trip_tracker.dart';
 import 'package:thesis_app/models/log_entry.dart';
 import 'package:thesis_app/services/fare_calculator.dart';
@@ -30,15 +32,17 @@ import 'package:thesis_app/widgets/route_finder_widgets.dart';
 // ══════════════════════════════════════════════════════════════════════════════
 
 class RouteFinderPage extends StatefulWidget {
-  final List<JeepneyRoute>    allRoutes;
-  final bool                  routesReady;
+  final List<JeepneyRoute>     allRoutes;
+  final PrecomputedRouteGraph? precomputedGraph;
+  final WalkGraph?             walkGraph;
   final void Function(LogEntry)?     onLog;
   final void Function(TripRecord)?   onTripComplete;
 
   const RouteFinderPage({
     super.key,
     required this.allRoutes,
-    required this.routesReady,
+    this.precomputedGraph,
+    this.walkGraph,
     this.onLog,
     this.onTripComplete,
   });
@@ -100,7 +104,6 @@ class _RouteFinderPageState extends State<RouteFinderPage> {
   int                   _selectedRec      = 0;
   bool                  _routingBusy      = false;
   bool                  _sheetMinimized   = false;
-  PrecomputedRouteGraph? _precomputedGraph;
   bool                  _roadsOnly        = false;
   RoutePriority         _priority         = RoutePriority.balanced;
 
@@ -126,31 +129,6 @@ class _RouteFinderPageState extends State<RouteFinderPage> {
     _originFocusNode.dispose();
     _destFocusNode.dispose();
     super.dispose();
-  }
-
-  @override
-  void didUpdateWidget(RouteFinderPage old) {
-    super.didUpdateWidget(old);
-    if (!old.routesReady && widget.routesReady) {
-      _precomputeGraph();
-      _maybeRunRouting();
-    }
-  }
-
-  // ── Precompute static graph once routes are loaded ───────────────────────────
-
-  void _precomputeGraph() {
-    if (widget.allRoutes.isEmpty) return;
-    compute(
-      runStaticGraphIsolate,
-      StaticGraphMessage(
-        allRoutes:            widget.allRoutes,
-        transferRadiusMeters: _router.transferRadiusMeters,
-        transferPenaltyMeters:_router.transferPenaltyMeters,
-      ),
-    ).then((graph) {
-      if (mounted) setState(() => _precomputedGraph = graph);
-    });
   }
 
   // ── GPS ──────────────────────────────────────────────────────────────────────
@@ -562,7 +540,7 @@ class _RouteFinderPageState extends State<RouteFinderPage> {
       return;
     }
 
-    if (!widget.routesReady || widget.allRoutes.isEmpty) return;
+    if (widget.allRoutes.isEmpty) return;
 
     final point    = (_origin ?? _destination)!;
     const radius   = 500.0;
@@ -599,9 +577,18 @@ class _RouteFinderPageState extends State<RouteFinderPage> {
       detail:  'From "${_originCtrl.text}" → "${_destCtrl.text}"',
     ));
 
-    // Run the routing algorithm in a background isolate so the UI thread is
-    // never blocked.  compute() requires a top-level function and a single
-    // serialisable argument — both are defined in jeepney_router.dart.
+    // ── Run walk graph lookups on main thread before entering isolate ─────────
+    // singleSource is fast (radius-bounded, ~few hundred nodes).
+    // Converting to SerialWalkMap strips the WalkGraph reference so only
+    // two small flat arrays cross the isolate boundary — not the full 2.5MB graph.
+    const scoringRadius = 700.0;
+    final originScoringMap = WalkRouter.singleSource(
+        source: _origin!, graph: widget.walkGraph,
+        radiusMeters: scoringRadius);
+    final destScoringMap   = WalkRouter.singleSource(
+        source: _destination!, graph: widget.walkGraph,
+        radiusMeters: scoringRadius);
+
     compute(
       runRoutingIsolate,
       RoutingMessage(
@@ -614,36 +601,111 @@ class _RouteFinderPageState extends State<RouteFinderPage> {
         maxTransfersAllowed:  _router.maxTransfersAllowed,
         maxResults:           _router.maxResults,
         priority:             _priority,
-        precomputedGraph:     _precomputedGraph,
+        precomputedGraph:     widget.precomputedGraph,
+        originWalkMap:        originScoringMap?.toSerial(widget.allRoutes),
+        destWalkMap:          destScoringMap?.toSerial(widget.allRoutes),
       ),
     ).then((result) {
       if (!mounted) return;
+
+      // ── Reconstruct walk polylines on main thread using full WalkDistanceMaps
+      // The isolate returned geometry-free RouteJourney objects (scores + indices
+      // only). We now attach road polylines using the maps that stayed on this thread.
+      final enriched = _enrichWithPolylines(result);
+
       final elapsed = _routingStartTime == null ? 0.0
           : DateTime.now().difference(_routingStartTime!).inMilliseconds / 1000.0;
-      if (result is RoutingSuccess) {
+      if (enriched is RoutingSuccess) {
         _log(LogEntry(
           type:    LogEventType.routingCompleted,
-          message: '${result.recommendations.length} route'
-                   '${result.recommendations.length == 1 ? '' : 's'} found',
+          message: '${enriched.recommendations.length} route'
+                   '${enriched.recommendations.length == 1 ? '' : 's'} found',
           detail:  'Completed in ${elapsed.toStringAsFixed(2)} s'
-                   '${result.hasTransfers ? ' · includes transfers' : ''}',
+                   '${enriched.hasTransfers ? ' · includes transfers' : ''}',
         ));
-      } else if (result is RoutingFailure) {
+      } else if (enriched is RoutingFailure) {
         _log(LogEntry(
           type:    LogEventType.routingCompleted,
           message: 'No routes found',
-          detail:  '${(result as RoutingFailure).reason} '
+          detail:  '${(enriched as RoutingFailure).reason} '
                    '(${elapsed.toStringAsFixed(2)} s)',
         ));
       }
       setState(() {
-        _routingResult  = result;
+        _routingResult  = enriched;
         _selectedRec    = 0;
         _routingBusy    = false;
         _sheetMinimized = false;
       });
       _fitToJourney();
     });
+  }
+
+  // ── Attach road walk polylines to routing result (main thread) ──────────────
+  // Called after compute() returns. The isolate produced RouteJourney objects
+  // with walk distances but no polylines. We now build polylines using the
+  // WalkDistanceMaps that stayed on this thread.
+
+  RoutingResult _enrichWithPolylines(RoutingResult result) {
+    if (result is! RoutingSuccess) return result;
+    if (widget.walkGraph == null) return result;
+
+    final enriched = result.recommendations.map((journey) {
+      final segs = <RouteSegment>[];
+      for (int i = 0; i < journey.segments.length; i++) {
+        final seg     = journey.segments[i];
+        final isFirst = i == 0;
+        final isLast  = i == journey.segments.length - 1;
+
+        // Walk to boarding — direct point-to-point Dijkstra, no radius cap
+        final boardPolyline = isFirst && widget.walkGraph != null
+            ? WalkRouter.route(
+                from:  _origin!,
+                to:    seg.boardingPoint,
+                graph: widget.walkGraph).polyline
+            : [isFirst ? _origin! : journey.segments[i-1].dropoffPoint,
+               seg.boardingPoint];
+
+        // Walk from dropoff — direct point-to-point Dijkstra, no radius cap
+        final dropPolyline = isLast && widget.walkGraph != null
+            ? WalkRouter.route(
+                from:  seg.dropoffPoint,
+                to:    _destination!,
+                graph: widget.walkGraph).polyline
+            : [seg.dropoffPoint, if (isLast) _destination!];
+
+        segs.add(RouteSegment(
+          route:                   seg.route,
+          boardingIndex:           seg.boardingIndex,
+          dropoffIndex:            seg.dropoffIndex,
+          walkToBoardingMeters:    seg.walkToBoardingMeters,
+          walkFromDropoffMeters:   seg.walkFromDropoffMeters,
+          isWrapAround:            seg.isWrapAround,
+          walkToBoardingPolyline:  boardPolyline,
+          walkFromDropoffPolyline: dropPolyline,
+        ));
+      }
+
+      final originPoly = segs.first.walkToBoardingPolyline;
+      final destPoly   = segs.last.walkFromDropoffPolyline.isNotEmpty
+          ? segs.last.walkFromDropoffPolyline
+          : [segs.last.dropoffPoint, _destination!];
+
+      return RouteJourney(
+        segments:                segs,
+        transferPoints:          journey.transferPoints,
+        totalWalkingMeters:      journey.totalWalkingMeters,
+        transferCount:           journey.transferCount,
+        estimatedJourneyMinutes: journey.estimatedJourneyMinutes,
+        score:                   journey.score,
+        originWalkPolyline:      originPoly,
+        destinationWalkPolyline: destPoly,
+      );
+    }).toList();
+
+    return RoutingSuccess(enriched,
+        hasTransfers: result.hasTransfers,
+        isFallback:   result.isFallback);
   }
 
   // ── Fit map to the selected journey ─────────────────────────────────────────
@@ -829,8 +891,11 @@ class _RouteFinderPageState extends State<RouteFinderPage> {
 
       // Walk to first boarding from origin
       if (i == 0) {
+        final pts = journey.originWalkPolyline.isNotEmpty
+            ? journey.originWalkPolyline
+            : [_origin!, seg.boardingPoint];
         lines.add(Polyline(
-          points:      [_origin!, seg.boardingPoint],
+          points:      pts,
           color:       const Color(0xFF34A853),
           strokeWidth: 2.5,
           pattern:     StrokePattern.dashed(segments: [8, 6]),
@@ -840,8 +905,11 @@ class _RouteFinderPageState extends State<RouteFinderPage> {
       // Walk between segments (transfer legs)
       if (i < journey.segments.length - 1) {
         final nextSeg = journey.segments[i + 1];
+        final pts = seg.walkFromDropoffPolyline.isNotEmpty
+            ? seg.walkFromDropoffPolyline
+            : [seg.dropoffPoint, nextSeg.boardingPoint];
         lines.add(Polyline(
-          points:      [seg.dropoffPoint, nextSeg.boardingPoint],
+          points:      pts,
           color:       Colors.purple,
           strokeWidth: 2.5,
           pattern:     StrokePattern.dashed(segments: [8, 6]),
@@ -850,8 +918,11 @@ class _RouteFinderPageState extends State<RouteFinderPage> {
 
       // Walk from last dropoff to destination
       if (i == journey.segments.length - 1) {
+        final pts = journey.destinationWalkPolyline.isNotEmpty
+            ? journey.destinationWalkPolyline
+            : [seg.dropoffPoint, _destination!];
         lines.add(Polyline(
-          points:      [seg.dropoffPoint, _destination!],
+          points:      pts,
           color:       const Color(0xFFEA4335),
           strokeWidth: 2.5,
           pattern:     StrokePattern.dashed(segments: [8, 6]),
@@ -1070,25 +1141,6 @@ class _RouteFinderPageState extends State<RouteFinderPage> {
               ]),
             ],
           ),
-
-          if (!widget.routesReady)
-            Positioned.fill(
-              child: Container(
-                color: Colors.white.withOpacity(0.82),
-                child: const Column(
-                  mainAxisAlignment: MainAxisAlignment.center,
-                  children: [
-                    CircularProgressIndicator(),
-                    SizedBox(height: 16),
-                    Text('Loading jeepney routes…',
-                        style: TextStyle(
-                            fontSize:   14,
-                            color:      Colors.black54,
-                            fontWeight: FontWeight.w500)),
-                  ],
-                ),
-              ),
-            ),
 
           if (!_showResults && !_pinMode)
             Positioned(

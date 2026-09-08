@@ -110,9 +110,15 @@ class RouteSegment {
   final double walkFromDropoffMeters;
 
   /// True when this segment wraps around the end of a circular route.
-  /// boarding index > dropoff index in this case; the ride goes
-  /// path[boardingIndex..last] + path[0..dropoffIndex].
   final bool isWrapAround;
+
+  /// Road-following polyline for the walk TO the boarding point.
+  /// Falls back to [prevPoint, boardingPoint] straight line if unavailable.
+  final List<LatLng> walkToBoardingPolyline;
+
+  /// Road-following polyline for the walk FROM the dropoff point.
+  /// Falls back to [dropoffPoint, nextPoint] straight line if unavailable.
+  final List<LatLng> walkFromDropoffPolyline;
 
   const RouteSegment({
     required this.route,
@@ -120,7 +126,9 @@ class RouteSegment {
     required this.dropoffIndex,
     required this.walkToBoardingMeters,
     required this.walkFromDropoffMeters,
-    this.isWrapAround = false,
+    this.isWrapAround               = false,
+    this.walkToBoardingPolyline     = const [],
+    this.walkFromDropoffPolyline    = const [],
   });
 
   LatLng get boardingPoint => route.path[boardingIndex];
@@ -136,11 +144,9 @@ class RouteSegment {
     double total = 0;
     final path   = route.path;
     if (isWrapAround) {
-      // boarding → end of path
       for (int i = boardingIndex; i < path.length - 1; i++) {
         total += const Distance().as(LengthUnit.Meter, path[i], path[i + 1]);
       }
-      // start of path → dropoff
       for (int i = 0; i < dropoffIndex; i++) {
         total += const Distance().as(LengthUnit.Meter, path[i], path[i + 1]);
       }
@@ -171,8 +177,6 @@ class RouteJourney {
   final List<RouteSegment> segments;
 
   /// Walking waypoints between consecutive segments (length = segments.length - 1).
-  /// Each element is the geographic midpoint of the transfer walk; useful for
-  /// drawing the walk polyline on the map.
   final List<LatLng> transferPoints;
 
   final double totalWalkingMeters;
@@ -182,8 +186,14 @@ class RouteJourney {
   /// 5 min penalty per transfer.
   final double estimatedJourneyMinutes;
 
-  /// Lower score = better. Combines walking, transfers, and ride efficiency.
+  /// Lower score = better.
   final double score;
+
+  /// Road-following polyline: origin → first boarding point.
+  final List<LatLng> originWalkPolyline;
+
+  /// Road-following polyline: last dropoff point → destination.
+  final List<LatLng> destinationWalkPolyline;
 
   const RouteJourney({
     required this.segments,
@@ -192,6 +202,8 @@ class RouteJourney {
     required this.transferCount,
     required this.estimatedJourneyMinutes,
     required this.score,
+    this.originWalkPolyline      = const [],
+    this.destinationWalkPolyline = const [],
   });
 
   bool get isDirect => transferCount == 0;
@@ -199,8 +211,6 @@ class RouteJourney {
   double get totalRideDistanceMeters =>
       segments.fold(0.0, (sum, s) => sum + s.rideDistanceMeters);
 
-  /// Concatenated polyline: walk-to-first-board, ride, walk-to-transfer,
-  /// ride, …, walk-to-destination.  Suitable for drawing the full path.
   List<LatLng> get fullPolyline {
     final points = <LatLng>[];
     for (int i = 0; i < segments.length; i++) {
@@ -211,8 +221,10 @@ class RouteJourney {
   }
 
   /// Convenience constructor: wrap a legacy RouteRecommendation as a
-  /// single-segment RouteJourney so both code paths share one result type.
-  factory RouteJourney.fromSingleRoute(RouteRecommendation rec) {
+  /// single-segment RouteJourney.
+  factory RouteJourney.fromSingleRoute(RouteRecommendation rec,
+      {List<LatLng> originWalkPolyline      = const [],
+       List<LatLng> destinationWalkPolyline = const []}) {
     final isWrap  = rec.boardingIndex > rec.dropoffIndex;
     final segment = RouteSegment(
       route:                 rec.route,
@@ -221,6 +233,8 @@ class RouteJourney {
       walkToBoardingMeters:  rec.walkToBoardingMeters,
       walkFromDropoffMeters: rec.walkFromDropoffMeters,
       isWrapAround:          isWrap,
+      walkToBoardingPolyline:  originWalkPolyline,
+      walkFromDropoffPolyline: destinationWalkPolyline,
     );
     final walking = rec.totalWalkingMeters;
     final poly   = segment.ridePolyline;
@@ -238,6 +252,8 @@ class RouteJourney {
       transferCount:           0,
       estimatedJourneyMinutes: minutes,
       score:                   rec.score,
+      originWalkPolyline:      originWalkPolyline,
+      destinationWalkPolyline: destinationWalkPolyline,
     );
   }
 }

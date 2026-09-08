@@ -8,6 +8,7 @@
 // Route Finder logic lives entirely in lib/screens/route_finder_page.dart
 
 import 'package:flutter/material.dart';
+import 'package:flutter/foundation.dart';
 import 'package:flutter_map/flutter_map.dart';
 import 'package:latlong2/latlong.dart';
 import 'package:thesis_app/models/log_entry.dart';
@@ -15,6 +16,8 @@ import 'package:thesis_app/data/jeepney_routes.dart';
 import 'package:thesis_app/screens/route_finder.dart';
 import 'package:thesis_app/screens/trip_tracker.dart';
 import 'package:thesis_app/services/pdf_exporter.dart';
+import 'package:thesis_app/services/jeepney_router.dart';
+import 'package:thesis_app/services/walk_graph.dart';
 
 void main() {
   runApp(const MyApp());
@@ -32,28 +35,56 @@ class MyApp extends StatefulWidget {
 
 class _MyAppState extends State<MyApp> {
   final List<JeepneyRoute> _allRoutes = [];
-  bool _routesReady = false;
+  PrecomputedRouteGraph?   _precomputedGraph;
+  WalkGraph?               _walkGraph;
+  bool                     _ready = false;
+  String                   _loadingStep = 'Loading routes…';
 
   @override
   void initState() {
     super.initState();
-    _loadAllRoutes();
+    _loadAll();
   }
 
-  /// Load every route in routeRegistry in parallel once at startup.
-  /// Both pages receive the same list — no user action required.
-  Future<void> _loadAllRoutes() async {
+  Future<void> _loadAll() async {
+    // ── Step 1: Load jeepney route GeoJSON files ─────────────────────────────
+    _setStep('Loading jeepney routes…');
     final futures = routeRegistry.map(loadSingleRoute);
     final results = await Future.wait(futures);
     final loaded  = results.whereType<JeepneyRoute>().toList();
+    _allRoutes.addAll(loaded);
+
+    // ── Step 2: Precompute static jeepney route graph ─────────────────────────
+    _setStep('Building route graph…');
+    final precomputed = await compute(
+      runStaticGraphIsolate,
+      StaticGraphMessage(
+        allRoutes:             loaded,
+        transferRadiusMeters:  180,
+        transferPenaltyMeters: 400,
+      ),
+    );
+
+    // ── Step 3: Load and index pedestrian road graph ──────────────────────────
+    _setStep('Loading road graph…');
+    WalkGraph? walkGraph;
+    try {
+      walkGraph = await WalkGraph.loadAsset();
+    } catch (_) {
+      // Asset not bundled — walk routing falls back to Haversine silently.
+    }
+
     if (mounted) {
       setState(() {
-        _allRoutes
-          ..clear()
-          ..addAll(loaded);
-        _routesReady = true;
+        _precomputedGraph = precomputed;
+        _walkGraph        = walkGraph;
+        _ready            = true;
       });
     }
+  }
+
+  void _setStep(String step) {
+    if (mounted) setState(() => _loadingStep = step);
   }
 
   @override
@@ -64,9 +95,83 @@ class _MyAppState extends State<MyApp> {
         colorScheme: ColorScheme.fromSeed(seedColor: const Color(0xFF1A73E8)),
         useMaterial3: true,
       ),
-      home: _AppShell(
-        allRoutes:   _allRoutes,
-        routesReady: _routesReady,
+      home: _ready
+          ? _AppShell(
+              allRoutes:        _allRoutes,
+              precomputedGraph: _precomputedGraph,
+              walkGraph:        _walkGraph,
+            )
+          : _LoadingScreen(step: _loadingStep),
+    );
+  }
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// LOADING SCREEN
+// ══════════════════════════════════════════════════════════════════════════════
+
+class _LoadingScreen extends StatelessWidget {
+  final String step;
+  const _LoadingScreen({required this.step});
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      backgroundColor: Colors.white,
+      body: SafeArea(
+        child: Center(
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              // Bus icon
+              Container(
+                width: 80, height: 80,
+                decoration: BoxDecoration(
+                  color: const Color(0xFF1A73E8).withOpacity(0.1),
+                  shape: BoxShape.circle,
+                ),
+                child: const Icon(
+                  Icons.directions_bus,
+                  size: 44,
+                  color: Color(0xFF1A73E8),
+                ),
+              ),
+              const SizedBox(height: 28),
+              const Text(
+                'Jeepney Route Finder',
+                style: TextStyle(
+                  fontSize:   22,
+                  fontWeight: FontWeight.bold,
+                  color:      Colors.black87,
+                ),
+              ),
+              const SizedBox(height: 8),
+              Text(
+                'Cebu City',
+                style: TextStyle(
+                  fontSize: 14,
+                  color:    Colors.grey[500],
+                ),
+              ),
+              const SizedBox(height: 40),
+              const SizedBox(
+                width: 32, height: 32,
+                child: CircularProgressIndicator(
+                  strokeWidth: 3,
+                  color: Color(0xFF1A73E8),
+                ),
+              ),
+              const SizedBox(height: 16),
+              Text(
+                step,
+                style: TextStyle(
+                  fontSize: 13,
+                  color:    Colors.grey[500],
+                ),
+              ),
+            ],
+          ),
+        ),
       ),
     );
   }
@@ -77,12 +182,14 @@ class _MyAppState extends State<MyApp> {
 // ══════════════════════════════════════════════════════════════════════════════
 
 class _AppShell extends StatefulWidget {
-  final List<JeepneyRoute> allRoutes;
-  final bool               routesReady;
+  final List<JeepneyRoute>    allRoutes;
+  final PrecomputedRouteGraph? precomputedGraph;
+  final WalkGraph?             walkGraph;
 
   const _AppShell({
     required this.allRoutes,
-    required this.routesReady,
+    this.precomputedGraph,
+    this.walkGraph,
   });
 
   @override
@@ -105,10 +212,11 @@ class _AppShellState extends State<_AppShell> {
         children: [
           // Page 0 — Route Finder
           RouteFinderPage(
-            allRoutes:      widget.allRoutes,
-            routesReady:    widget.routesReady,
-            onLog:          _addLog,
-            onTripComplete: _addTrip,
+            allRoutes:        widget.allRoutes,
+            precomputedGraph: widget.precomputedGraph,
+            walkGraph:        widget.walkGraph,
+            onLog:            _addLog,
+            onTripComplete:   _addTrip,
           ),
           // Page 1 — Directory
           _DirectoryPage(allRoutes: widget.allRoutes),
